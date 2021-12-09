@@ -1,0 +1,1 @@
+# vagrant-mini-elastic-stack
