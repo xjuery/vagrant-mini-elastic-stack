@@ -1,0 +1,477 @@
+---
+
+- hosts: all
+  become: true
+  vars:
+    elastic_version: 7.15.2
+    set_dark_mode : false
+    elastic_download: https://artifacts.elastic.co
+    elastic_user_password: password
+    apm_system_user_password: password
+    kibana_user_password: password
+    logstash_system_user_password: password
+    beats_system_user_password: password
+    remote_monitoring_user_password: password
+    logstash_internal_password: password
+
+  tasks:
+
+##########################################################################################################
+# Prepare the dependencies
+
+  - name: Get the platform (i386 or amd64) of the virtual machine
+    command: dpkg --print-architecture
+    register: print_architecture
+
+  - name: And set the actual platform value as a variable
+    set_fact:
+      platform: "{{ print_architecture.stdout }}"
+
+  - name: Install unzip for unpacking files later on
+    apt: name=unzip state=latest
+
+  - name: Install expect for ansible
+    apt: name=expect state=latest
+
+  - name: Install pexpect for ansible
+    apt: name=python3-pexpect state=latest
+
+  - name: Install NTP to avoid time drift inside the VM
+    apt: name={{ item }} state=latest
+    loop:
+      - ntp
+      - ntpdate
+
+  - name: Install the JRE
+    apt: name=openjdk-8-jre-headless state=latest update_cache=yes install_recommends=no
+
+  - name: Install pip to get current Python dependencies
+    apt: name=python3-pip state=latest
+
+##########################################################################################################
+# Install Elasticsearch
+
+  - name: Get Elasticsearch
+    get_url:
+      url={{ elastic_download }}/downloads/elasticsearch/elasticsearch-{{ elastic_version }}-amd64.deb
+      dest=/opt/elasticsearch.deb
+
+  - name: Install Elasticsearch
+    apt: deb=/opt/elasticsearch.deb
+
+  - name: Make sure Elasticsearch autostarts, but is stopped until it is properly configured
+    service: name=elasticsearch enabled=yes state=stopped
+
+##########################################################################################################
+# Install kibana
+
+  - name: Get Kibana
+    get_url:
+      url={{ elastic_download }}/downloads/kibana/kibana-{{ elastic_version }}-{{ platform }}.deb
+      dest=/opt/kibana.deb
+
+  - name: Install Kibana
+    apt: deb=/opt/kibana.deb
+
+  - name: Make sure Kibana autostarts, but is stopped until it is properly configured
+    service: name=kibana enabled=yes state=stopped
+
+##########################################################################################################
+# Prepare the CA certs
+
+  - name: Create CA certificates
+    expect:
+      command: /usr/share/elasticsearch/bin/elasticsearch-certutil ca --pem
+      responses:
+        'Please enter the desired output file \[elastic-stack-ca.zip\]:' : "\n"
+
+  - name: Creates CA directory
+    file:
+      path: /usr/share/elasticsearch/ca
+      state: directory
+
+  - name: Unzip CA certificates
+    command: unzip /usr/share/elasticsearch/elastic-stack-ca.zip -d /usr/share/elasticsearch/
+
+  - name: Create instance certificates
+    expect:
+      command: /usr/share/elasticsearch/bin/elasticsearch-certutil cert --ca-cert /usr/share/elasticsearch/ca/ca.crt --ca-key /usr/share/elasticsearch/ca/ca.key --ip 127.0.0.1 --pem
+      responses:
+        'Please enter the desired output file \[certificate-bundle.zip\]:' : "\n"
+
+  - name: Creates certificate directory
+    file:
+      path: /usr/share/elasticsearch/instance
+      state: directory
+
+  - name: Unzip instance certificates
+    command: unzip /usr/share/elasticsearch/certificate-bundle.zip -d /usr/share/elasticsearch/
+
+  - name: Creates configuration ca directory
+    file:
+      path: /etc/elasticsearch/ca
+      state: directory
+
+  - name: Creates configuration instance directory
+    file:
+      path: /etc/elasticsearch/instance
+      state: directory
+
+  - name: Creates elastic directory in server ca directory
+    file:
+      path: /usr/local/share/ca-certificates/elastic
+      state: directory
+
+  - name: Copy CA certificate to server ca directory
+    copy:
+      src: /usr/share/elasticsearch/ca/ca.crt
+      dest: /usr/local/share/ca-certificates/elastic/
+      owner: root
+      group: root
+      mode: 0644
+
+  - name: Update server certificates
+    command: update-ca-certificates
+
+  - name: Copy CA certificate to elasticsearch directory
+    copy:
+      src: /usr/share/elasticsearch/ca/ca.crt
+      dest: /etc/elasticsearch/ca/ca.crt
+      owner: root
+      group: elasticsearch
+      mode: 0644
+
+  - name: Copy instance certificate to elasticsearch directory
+    copy:
+      src: /usr/share/elasticsearch/instance/instance.crt
+      dest: /etc/elasticsearch/instance/instance.crt
+      owner: root
+      group: elasticsearch
+      mode: 0644
+
+  - name: Copy instance key to elasticsearch directory
+    copy:
+      src: /usr/share/elasticsearch/instance/instance.key
+      dest: /etc/elasticsearch/instance/instance.key
+      owner: root
+      group: elasticsearch
+      mode: 0644
+
+##########################################################################################################
+# Update the elasticsearch.yml parameters
+
+  - name: Change Elasticsearch's minimum memory usage to 512MB
+    lineinfile:
+      path: /etc/elasticsearch/jvm.options
+      regexp: "^-Xms"
+      line: "-Xms512m"
+      state: present
+
+  - name: Change Elasticsearch's maximum memory usage to 512MB
+    lineinfile:
+      path: /etc/elasticsearch/jvm.options
+      regexp: "^-Xmx"
+      line: "-Xmx512m"
+      state: present
+
+  - name: Do not swap
+    lineinfile:
+      path: /etc/elasticsearch/elasticsearch.yml
+      regexp: "bootstrap.memory_lock"
+      line: "bootstrap.memory_lock: true"
+      state: present
+
+  - name: We only have a single node, set minimum master nodes accordingly
+    lineinfile:
+      path: /etc/elasticsearch/elasticsearch.yml
+      regexp: "discovery.zen.minimum_master_nodes"
+      line: "discovery.zen.minimum_master_nodes: 1"
+      state: present
+
+  - name: Require explicit names when deleting indices
+    lineinfile:
+      path: /etc/elasticsearch/elasticsearch.yml
+      regexp: "action.destructive_requires_name"
+      line: "action.destructive_requires_name: true"
+      state: present
+
+  - name: Disable watermarks, since disk space might be tight on the 10GB base box
+    lineinfile:
+      path: /etc/elasticsearch/elasticsearch.yml
+      regexp: "cluster.routing.allocation.disk.threshold_enabled"
+      line:  "cluster.routing.allocation.disk.threshold_enabled: false"
+      state: present
+
+  - name: Enable monitoring of the Elastic Stack
+    lineinfile:
+      path: /etc/elasticsearch/elasticsearch.yml
+      regexp: "xpack.monitoring.collection.enabled"
+      line:  "xpack.monitoring.collection.enabled: true"
+      state: present
+
+  - name: Enable security for the Elastic Stack
+    lineinfile:
+      path: /etc/elasticsearch/elasticsearch.yml
+      regexp: "xpack.security.enabled"
+      line:  "xpack.security.enabled: true"
+      state: present
+
+  - name: Enable SSL for transport within the Elastic Stack
+    lineinfile:
+      path: /etc/elasticsearch/elasticsearch.yml
+      regexp: "xpack.security.transport.ssl.enabled"
+      line:  "xpack.security.transport.ssl.enabled: true"
+      state: present
+
+  - name: Make transport SSL verification mode 'certificate' within the Elastic Stack
+    lineinfile:
+      path: /etc/elasticsearch/elasticsearch.yml
+      regexp: "xpack.security.transport.ssl.verification_mode"
+      line:  "xpack.security.transport.ssl.verification_mode: certificate"
+      state: present
+
+  - name: Set path to transport ssl key within the Elastic Stack
+    lineinfile:
+      path: /etc/elasticsearch/elasticsearch.yml
+      regexp: "xpack.security.transport.ssl.key"
+      line:  "xpack.security.transport.ssl.key: /etc/elasticsearch/instance/instance.key"
+      state: present
+
+  - name: Set path to transport ssl certificate within the Elastic Stack
+    lineinfile:
+      path: /etc/elasticsearch/elasticsearch.yml
+      regexp: "xpack.security.transport.ssl.certificate"
+      line:  "xpack.security.transport.ssl.certificate: /etc/elasticsearch/instance/instance.crt"
+      state: present
+
+  - name: Set path to transport ssl CA certificate within the Elastic Stack
+    lineinfile:
+      path: /etc/elasticsearch/elasticsearch.yml
+      regexp: "xpack.security.transport.ssl.certificate_authorities"
+      line:  "xpack.security.transport.ssl.certificate_authorities: [ '/etc/elasticsearch/ca/ca.crt' ]"
+      state: present
+
+  - name: Enable SSL for HTTP for the Elastic Stack
+    lineinfile:
+      path: /etc/elasticsearch/elasticsearch.yml
+      regexp: "xpack.security.http.ssl.enabled"
+      line:  "xpack.security.http.ssl.enabled: true"
+      state: present
+
+  - name: Set path to HTTP ssl key within the Elastic Stack
+    lineinfile:
+      path: /etc/elasticsearch/elasticsearch.yml
+      regexp: "xpack.security.http.ssl.key"
+      line:  "xpack.security.http.ssl.key:  /etc/elasticsearch/instance/instance.key"
+      state: present
+
+  - name: Set path to HTTP ssl certificate within the Elastic Stack
+    lineinfile:
+      path: /etc/elasticsearch/elasticsearch.yml
+      regexp: "xpack.security.http.ssl.certificate"
+      line:  "xpack.security.http.ssl.certificate: /etc/elasticsearch/instance/instance.crt"
+      state: present
+
+  - name: Set path to HTTP ssl CA certificate within the Elastic Stack
+    lineinfile:
+      path: /etc/elasticsearch/elasticsearch.yml
+      regexp: "xpack.security.http.ssl.certificate_authorities"
+      line:  "xpack.security.http.ssl.certificate_authorities: [ '/etc/elasticsearch/ca/ca.crt' ]"
+      state: present
+
+##########################################################################################################
+# Start Elasticsearch
+
+  - name: Set the right ulimits
+    shell: ulimit -n 65536
+  - shell: ulimit -l unlimited
+
+  - name: Start Elasticsearch
+    service: name=elasticsearch state=restarted
+
+  - name: Wait for Elasticsearch to become available
+    wait_for:
+      port: 9200
+      delay: 5
+
+##########################################################################################################
+# Create the builtin passwords
+
+  - name: Create reserved user passwords
+    expect:
+      command: /usr/share/elasticsearch/bin/elasticsearch-setup-passwords interactive
+      echo: yes
+      responses:
+        '.*continue.*' : "y\n"
+        '.*elastic.*' : "{{ elastic_user_password }}\n"
+        '.*apm_system.*' : "{{ apm_system_user_password }}\n"
+        '.*kibana.*' : "{{ kibana_user_password }}\n"
+        '.*logstash_system.*' : "{{ logstash_system_user_password }}\n"
+        '.*beats_system.*' : "{{ beats_system_user_password }}\n"
+        '.*remote_monitoring_user.*' : "{{ remote_monitoring_user_password }}\n"
+
+##########################################################################################################
+# Activate the X-Pack license
+
+  - name: Active the 30 day X-Pack trial
+    uri:
+      url: https://127.0.0.1:9200/_xpack/license/start_trial?acknowledge=true
+      user: elastic
+      password: "{{ elastic_user_password }}"
+      method: POST
+      force_basic_auth: yes
+      validate_certs: false
+      status_code:
+        - 200
+        - 403
+
+  - name: Wait for trial to register
+    pause: 
+      minutes: 1
+  
+##########################################################################################################
+# Update the kibana.yml parameters
+
+  - name: Make Kibana available on all network interfaces
+    lineinfile:
+      path: /etc/kibana/kibana.yml
+      regexp: '^server.host'
+      line: 'server.host: "0.0.0.0"'
+
+  - name: Create the Kibana logging directory
+    file: path=/var/log/kibana/ state=directory owner=kibana group=kibana
+
+  - name: Enable persistent Kibana logs
+    lineinfile:
+      path: /etc/kibana/kibana.yml
+      regexp: '^logging.dest'
+      line: 'logging.dest: /var/log/kibana/kibana.log'
+
+  - name: Creates configuration ca directory
+    file:
+      path: /etc/kibana/ca
+      state: directory
+
+  - name: Creates configuration instance directory
+    file:
+      path: /etc/kibana/instance
+      state: directory
+
+  - name: Copy CA certificate to kibana directory
+    copy:
+      src: /usr/share/elasticsearch/ca/ca.crt
+      dest: /etc/kibana/ca/ca.crt
+      owner: root
+      group: kibana
+      mode: 0644
+
+  - name: Copy instance certificate to kibana directory
+    copy:
+      src: /usr/share/elasticsearch/instance/instance.crt
+      dest: /etc/kibana/instance/instance.crt
+      owner: root
+      group: kibana
+      mode: 0644
+
+  - name: Copy instance key to kibana directory
+    copy:
+      src: /usr/share/elasticsearch/instance/instance.key
+      dest: /etc/kibana/instance/instance.key
+      owner: root
+      group: kibana
+      mode: 0644
+
+  - name: Change Elasticsearch hosts
+    lineinfile:
+      path: /etc/kibana/kibana.yml
+      regexp: 'elasticsearch.hosts'
+      line: 'elasticsearch.hosts: ["https://127.0.0.1:9200"]'
+
+  - name: Set Elasticsearch username 
+    lineinfile:
+      path: /etc/kibana/kibana.yml
+      regexp: 'elasticsearch.username'
+      line: 'elasticsearch.username: "kibana"'
+
+  - name: Set Kibana user password 
+    lineinfile:
+      path: /etc/kibana/kibana.yml
+      regexp: 'elasticsearch.password'
+      line: 'elasticsearch.password: {{ kibana_user_password }}'
+
+  - name: Enable SSL for Kibana server
+    lineinfile:
+      path: /etc/kibana/kibana.yml
+      regexp: 'server.ssl.enabled'
+      line: 'server.ssl.enabled: true'
+
+  - name: Set path to instance certificate for server
+    lineinfile:
+      path: /etc/kibana/kibana.yml
+      regexp: 'server.ssl.certificate'
+      line: 'server.ssl.certificate: /etc/kibana/instance/instance.crt'
+
+  - name: Set path to instance key for server
+    lineinfile:
+      path: /etc/kibana/kibana.yml
+      regexp: 'server.ssl.key'
+      line: 'server.ssl.key: /etc/kibana/instance/instance.key'
+
+  - name: Set path to instance certificate for elasticsearch
+    lineinfile:
+      path: /etc/kibana/kibana.yml
+      regexp: 'elasticsearch.ssl.certificate'
+      line: 'elasticsearch.ssl.certificate: /etc/kibana/instance/instance.crt'
+
+  - name: Set path to instance key for elasticsearch
+    lineinfile:
+      path: /etc/kibana/kibana.yml
+      regexp: 'elasticsearch.ssl.key'
+      line: 'elasticsearch.ssl.key: /etc/kibana/instance/instance.key'
+
+  - name: Set path to CA
+    lineinfile:
+      path: /etc/kibana/kibana.yml
+      regexp: 'elasticsearch.ssl.certificateAuthorities'
+      line: 'elasticsearch.ssl.certificateAuthorities: /etc/kibana/ca/ca.crt'
+
+  - name: Set certificate verification mode for elasticsearch
+    lineinfile:
+      path: /etc/kibana/kibana.yml
+      regexp: 'elasticsearch.ssl.verificationMode'
+      line: 'elasticsearch.ssl.verificationMode: certificate'
+
+##########################################################################################################
+# Start Kibana
+
+  - name: Start Kibana
+    service: name=kibana state=restarted
+
+  - name: Wait for Kibana to become available
+    wait_for:
+      port: 5601
+      delay: 5
+  
+  - name: Wait for Kibana to be ready
+    pause: 
+      minutes: 2
+
+##########################################################################################################
+# Eventually set the dark mode in kibana
+
+  - name: Set dark mode
+    uri:
+      url: https://127.0.0.1:5601/api/kibana/settings/theme:darkMode
+      user: elastic
+      password: "{{ elastic_user_password }}"
+      method: POST
+      body: '{"value":"true"}'
+      headers:
+        Content-Type: "application/json"
+        kbn-xsrf: true
+      force_basic_auth: yes
+      status_code: 200
+      body_format: json
+      validate_certs: no
+    when: set_dark_mode|bool == true
+      
